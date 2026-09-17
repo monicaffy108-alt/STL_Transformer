@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Blender
+*.blend
+*.blend1
+*.blend2
+*.blend3
+*.blend4
+*.blend5
+*.blend6
+*.blend7
+*.blend8
+*.blend9
+
+# Output files
+output/
+output_*/
+*.glb
+*.obj
+*.mtl
+*.stl
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

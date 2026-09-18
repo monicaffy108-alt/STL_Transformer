@@ -1,6 +1,7 @@
 """
 STL Transformer - Blender Addon
 Batch convert STL files to GLB and OBJ formats with automatic color schemes.
+Supports URDF-based assembly to export complete models with correct positioning.
 
 Author: [Your Name]
 License: MIT
@@ -9,16 +10,19 @@ License: MIT
 bl_info = {
     "name": "STL Transformer",
     "author": "[Your Name]",
-    "version": (1, 0, 0),
+    "version": (2, 0, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar (N) > STL Transformer",
-    "description": "Batch convert STL files to GLB and OBJ with auto color schemes",
+    "description": "Batch convert STL to GLB and OBJ, or assemble URDF into complete models",
     "category": "Import-Export",
 }
 
 import bpy
 import os
+import math
 import traceback
+import xml.etree.ElementTree as ET
+from mathutils import Matrix, Vector
 
 COLOR_SCHEMES = {
     "light_blue": {
@@ -99,6 +103,109 @@ def create_material(obj, part_type, scheme_name):
     obj.data.materials.append(mat)
 
 
+def rpy_to_matrix(r, p, y):
+    """Convert URDF roll-pitch-yaw to 4x4 rotation matrix (Rz @ Ry @ Rx)."""
+    rx = Matrix.Rotation(r, 4, 'X')
+    ry = Matrix.Rotation(p, 4, 'Y')
+    rz = Matrix.Rotation(y, 4, 'Z')
+    return rz @ ry @ rx
+
+
+def parse_urdf(urdf_path):
+    """Parse URDF, compute world transforms for each link's visual mesh.
+    Returns list of (link_name, mesh_abs_path, world_matrix_4x4).
+    """
+    tree = ET.parse(urdf_path)
+    root = tree.getroot()
+    urdf_dir = os.path.dirname(urdf_path)
+
+    # Collect links: name -> {mesh, xyz, rpy}
+    links = {}
+    for link_elem in root.findall('link'):
+        name = link_elem.get('name')
+        visual = link_elem.find('visual')
+        if visual is None:
+            continue
+        mesh_elem = visual.find('geometry/mesh')
+        if mesh_elem is None:
+            continue
+        mesh_file = mesh_elem.get('filename')
+        xyz = [0.0, 0.0, 0.0]
+        rpy = [0.0, 0.0, 0.0]
+        origin = visual.find('origin')
+        if origin is not None:
+            xyz_str = origin.get('xyz', '0 0 0')
+            rpy_str = origin.get('rpy', '0 0 0')
+            xyz = [float(x) for x in xyz_str.split()]
+            rpy = [float(x) for x in rpy_str.split()]
+        links[name] = {'mesh': mesh_file, 'xyz': xyz, 'rpy': rpy}
+
+    # Collect joints: parent -> child with origin transform
+    joints = []
+    for joint_elem in root.findall('joint'):
+        parent = joint_elem.find('parent').get('link')
+        child = joint_elem.find('child').get('link')
+        xyz = [0.0, 0.0, 0.0]
+        rpy = [0.0, 0.0, 0.0]
+        origin = joint_elem.find('origin')
+        if origin is not None:
+            xyz_str = origin.get('xyz', '0 0 0')
+            rpy_str = origin.get('rpy', '0 0 0')
+            xyz = [float(x) for x in xyz_str.split()]
+            rpy = [float(x) for x in rpy_str.split()]
+        joints.append({'parent': parent, 'child': child, 'xyz': xyz, 'rpy': rpy})
+
+    # Build child map: parent_link -> [joint, ...]
+    child_map = {}
+    for j in joints:
+        child_map.setdefault(j['parent'], []).append(j)
+
+    # Find root links (appear as parent but never as child)
+    all_children = set(j['child'] for j in joints)
+    all_parents = set(j['parent'] for j in joints)
+    root_links = all_parents - all_children
+    if not root_links:
+        root_links = set(links.keys())
+
+    # BFS to compute world transforms
+    world_transforms = {}
+    for rl in root_links:
+        world_transforms[rl] = Matrix.Identity(4)
+        queue = [rl]
+        while queue:
+            current = queue.pop(0)
+            for j in child_map.get(current, []):
+                child = j['child']
+                rot = rpy_to_matrix(j['rpy'][0], j['rpy'][1], j['rpy'][2])
+                trans = Matrix.Translation(Vector(j['xyz']))
+                joint_tf = world_transforms[current] @ trans @ rot
+                if child in links:
+                    vrot = rpy_to_matrix(links[child]['rpy'][0], links[child]['rpy'][1], links[child]['rpy'][2])
+                    vtrans = Matrix.Translation(Vector(links[child]['xyz']))
+                    world_transforms[child] = joint_tf @ vtrans @ vrot
+                else:
+                    world_transforms[child] = joint_tf
+                queue.append(child)
+
+    # Resolve mesh absolute paths
+    result = []
+    for link_name, info in links.items():
+        mesh_rel = info['mesh']
+        mesh_abs = os.path.join(urdf_dir, mesh_rel)
+        if not os.path.exists(mesh_abs):
+            base = os.path.basename(mesh_rel)
+            meshes_dir = os.path.join(urdf_dir, 'meshes')
+            if os.path.isdir(meshes_dir):
+                for f in os.listdir(meshes_dir):
+                    if f.lower() == base.lower():
+                        mesh_abs = os.path.join(meshes_dir, f)
+                        break
+        world_mat = world_transforms.get(link_name, Matrix.Identity(4))
+        result.append((link_name, mesh_abs, world_mat))
+
+    return result
+
+
 def scan_stl_files(input_dir, recursive):
     stl_files = []
     if recursive:
@@ -111,6 +218,16 @@ def scan_stl_files(input_dir, recursive):
             if f.lower().endswith('.stl'):
                 stl_files.append(os.path.join(input_dir, f))
     return sorted(stl_files)
+
+
+def clear_scene():
+    """Remove all objects, meshes, and materials from the scene."""
+    bpy.ops.object.select_all(action='SELECT')
+    bpy.ops.object.delete()
+    for mesh in bpy.data.meshes:
+        bpy.data.meshes.remove(mesh)
+    for mat in bpy.data.materials:
+        bpy.data.materials.remove(mat)
 
 
 # ========== Operators ==========
@@ -149,6 +266,23 @@ class STL_OT_select_output(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
 
+class STL_OT_select_urdf(bpy.types.Operator):
+    bl_idname = "stl_transformer.select_urdf"
+    bl_label = "Select URDF File"
+    bl_options = {'REGISTER'}
+
+    filepath: bpy.props.StringProperty(subtype='FILE_PATH')
+
+    def execute(self, context):
+        context.scene.stl_urdf_path = self.filepath
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        wm = context.window_manager
+        wm.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+
 class STL_OT_convert(bpy.types.Operator):
     bl_idname = "stl_transformer.convert"
     bl_label = "Convert"
@@ -157,17 +291,12 @@ class STL_OT_convert(bpy.types.Operator):
 
     def execute(self, context):
         scene = context.scene
-        input_dir = scene.stl_input_dir
+        mode = scene.stl_mode
         output_dir = scene.stl_output_dir
         color_scheme = scene.stl_color_scheme
         export_glb = scene.stl_export_glb
         export_obj = scene.stl_export_obj
-        recursive = scene.stl_recursive
-        overwrite = scene.stl_overwrite
 
-        if not input_dir or not os.path.isdir(input_dir):
-            self.report({'ERROR'}, "Input directory does not exist")
-            return {'CANCELLED'}
         if not output_dir:
             self.report({'ERROR'}, "Please set output directory")
             return {'CANCELLED'}
@@ -176,6 +305,21 @@ class STL_OT_convert(bpy.types.Operator):
             return {'CANCELLED'}
 
         os.makedirs(output_dir, exist_ok=True)
+
+        if mode == 'URDF':
+            return self.assemble_urdf(context, scene, output_dir, color_scheme, export_glb, export_obj)
+        else:
+            return self.convert_individual(context, scene, output_dir, color_scheme, export_glb, export_obj)
+
+    def convert_individual(self, context, scene, output_dir, color_scheme, export_glb, export_obj):
+        input_dir = scene.stl_input_dir
+        recursive = scene.stl_recursive
+        overwrite = scene.stl_overwrite
+
+        if not input_dir or not os.path.isdir(input_dir):
+            self.report({'ERROR'}, "Input directory does not exist")
+            return {'CANCELLED'}
+
         stl_files = scan_stl_files(input_dir, recursive)
         if not stl_files:
             self.report({'WARNING'}, "No STL files found")
@@ -183,9 +327,6 @@ class STL_OT_convert(bpy.types.Operator):
 
         success_count = 0
         fail_count = 0
-
-        bpy.ops.object.select_all(action='SELECT')
-        bpy.ops.object.delete()
 
         for i, stl_path in enumerate(stl_files):
             stl_name = os.path.basename(stl_path)
@@ -197,14 +338,11 @@ class STL_OT_convert(bpy.types.Operator):
             glb_path = os.path.join(out_subdir, base_name + ".glb")
             obj_path = os.path.join(out_subdir, base_name + ".obj")
 
-            try:
-                bpy.ops.object.select_all(action='SELECT')
-                bpy.ops.object.delete()
-                for mesh in bpy.data.meshes:
-                    bpy.data.meshes.remove(mesh)
-                for mat in bpy.data.materials:
-                    bpy.data.materials.remove(mat)
+            if not overwrite and (os.path.exists(glb_path) or os.path.exists(obj_path)):
+                continue
 
+            try:
+                clear_scene()
                 bpy.ops.wm.stl_import(filepath=stl_path)
                 obj = bpy.context.active_object
                 if obj is None and bpy.context.selected_objects:
@@ -229,17 +367,84 @@ class STL_OT_convert(bpy.types.Operator):
                 fail_count += 1
                 print(f"FAIL: {stl_name} -> {e}")
 
-        bpy.ops.object.select_all(action='SELECT')
-        bpy.ops.object.delete()
-        for mesh in bpy.data.meshes:
-            bpy.data.meshes.remove(mesh)
-        for mat in bpy.data.materials:
-            bpy.data.materials.remove(mat)
-
+        clear_scene()
         msg = f"Done! Success {success_count}/{len(stl_files)}"
         if fail_count > 0:
             msg += f", Failed {fail_count}"
         self.report({'INFO'}, msg)
+        return {'FINISHED'}
+
+    def assemble_urdf(self, context, scene, output_dir, color_scheme, export_glb, export_obj):
+        urdf_path = scene.stl_urdf_path
+        join_meshes = scene.stl_join_meshes
+
+        if not urdf_path or not os.path.isfile(urdf_path):
+            self.report({'ERROR'}, "URDF file does not exist")
+            return {'CANCELLED'}
+
+        try:
+            link_list = parse_urdf(urdf_path)
+        except Exception as e:
+            self.report({'ERROR'}, f"URDF parse failed: {e}")
+            return {'CANCELLED'}
+
+        if not link_list:
+            self.report({'WARNING'}, "No meshes found in URDF")
+            return {'CANCELLED'}
+
+        clear_scene()
+
+        imported = []
+        for link_name, mesh_path, world_mat in link_list:
+            if not os.path.exists(mesh_path):
+                print(f"SKIP (file not found): {link_name} -> {mesh_path}")
+                continue
+            try:
+                bpy.ops.wm.stl_import(filepath=mesh_path)
+                obj = bpy.context.active_object
+                if obj is None and bpy.context.selected_objects:
+                    obj = bpy.context.selected_objects[0]
+                if obj is None:
+                    continue
+                obj.name = link_name
+                obj.matrix_world = world_mat.copy()
+                part_type = get_part_type(os.path.basename(mesh_path))
+                create_material(obj, part_type, color_scheme)
+                imported.append(obj)
+            except Exception as e:
+                print(f"FAIL import {link_name}: {e}")
+
+        if not imported:
+            self.report({'ERROR'}, "No meshes could be imported")
+            return {'CANCELLED'}
+
+        bpy.ops.object.select_all(action='DESELECT')
+        for obj in imported:
+            obj.select_set(True)
+        bpy.context.view_layer.objects.active = imported[0]
+
+        urdf_name = os.path.splitext(os.path.basename(urdf_path))[0]
+        glb_path = os.path.join(output_dir, urdf_name + "_assembled.glb")
+        obj_path = os.path.join(output_dir, urdf_name + "_assembled.obj")
+
+        try:
+            if export_glb:
+                bpy.ops.export_scene.gltf(filepath=glb_path, export_format='GLB', use_selection=True)
+            if export_obj:
+                if join_meshes:
+                    bpy.context.view_layer.objects.active = imported[0]
+                    bpy.ops.object.join()
+                    obj_joined = bpy.context.active_object
+                    obj_joined.select_set(True)
+                    bpy.ops.wm.obj_export(filepath=obj_path, export_selected_objects=True)
+                else:
+                    bpy.ops.wm.obj_export(filepath=obj_path, export_selected_objects=True)
+        except Exception as e:
+            self.report({'ERROR'}, f"Export failed: {e}")
+            return {'CANCELLED'}
+
+        clear_scene()
+        self.report({'INFO'}, f"Assembled {len(imported)} parts -> {urdf_name}_assembled")
         return {'FINISHED'}
 
 
@@ -257,39 +462,54 @@ class STL_PT_main_panel(bpy.types.Panel):
         scene = context.scene
 
         try:
-            # Input
             box = layout.box()
-            box.label(text="Input Settings")
-            row = box.row(align=True)
-            row.prop(scene, "stl_input_dir", text="")
-            row.operator("stl_transformer.select_input", text="Browse")
-            box.prop(scene, "stl_recursive")
+            box.label(text="Mode")
+            box.prop(scene, "stl_mode", text="")
 
-            # Output
+            if scene.stl_mode == 'INDIVIDUAL':
+                box = layout.box()
+                box.label(text="Input Settings")
+                row = box.row(align=True)
+                row.prop(scene, "stl_input_dir", text="")
+                row.operator("stl_transformer.select_input", text="Browse")
+                box.prop(scene, "stl_recursive")
+            else:
+                box = layout.box()
+                box.label(text="URDF File")
+                row = box.row(align=True)
+                row.prop(scene, "stl_urdf_path", text="")
+                row.operator("stl_transformer.select_urdf", text="Browse")
+
             box = layout.box()
             box.label(text="Output Settings")
             row = box.row(align=True)
             row.prop(scene, "stl_output_dir", text="")
             row.operator("stl_transformer.select_output", text="Browse")
-            box.prop(scene, "stl_overwrite")
+            if scene.stl_mode == 'INDIVIDUAL':
+                box.prop(scene, "stl_overwrite")
 
-            # Format
             box = layout.box()
             box.label(text="Export Format")
             row = box.row()
             row.prop(scene, "stl_export_glb")
             row.prop(scene, "stl_export_obj")
 
-            # Color
+            if scene.stl_mode == 'URDF':
+                box = layout.box()
+                box.label(text="Assembly Options")
+                box.prop(scene, "stl_join_meshes")
+
             box = layout.box()
             box.label(text="Color Scheme")
             box.prop(scene, "stl_color_scheme", text="")
 
-            # Convert
             layout.separator()
             col = layout.column()
             col.scale_y = 1.8
-            col.operator("stl_transformer.convert", text="Start Conversion")
+            if scene.stl_mode == 'INDIVIDUAL':
+                col.operator("stl_transformer.convert", text="Start Conversion")
+            else:
+                col.operator("stl_transformer.convert", text="Assemble & Export")
 
         except Exception as e:
             layout.label(text="ERROR in draw():")
@@ -302,6 +522,7 @@ class STL_PT_main_panel(bpy.types.Panel):
 classes = (
     STL_OT_select_input,
     STL_OT_select_output,
+    STL_OT_select_urdf,
     STL_OT_convert,
     STL_PT_main_panel,
 )
@@ -317,6 +538,9 @@ def register():
         "stl_export_obj",
         "stl_recursive",
         "stl_overwrite",
+        "stl_mode",
+        "stl_urdf_path",
+        "stl_join_meshes",
     ]
     for prop_name in old_props:
         if hasattr(bpy.types.Scene, prop_name):
@@ -328,6 +552,14 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
 
+    bpy.types.Scene.stl_mode = bpy.props.EnumProperty(
+        name="Mode",
+        items=[
+            ('INDIVIDUAL', "Individual Files", "Batch convert each STL separately"),
+            ('URDF', "URDF Assembly", "Assemble parts using URDF transforms into complete model"),
+        ],
+        default='INDIVIDUAL',
+    )
     bpy.types.Scene.stl_input_dir = bpy.props.StringProperty(
         name="Input Dir",
         description="Folder containing STL files",
@@ -339,6 +571,12 @@ def register():
         description="Output folder",
         default="",
         subtype='DIR_PATH',
+    )
+    bpy.types.Scene.stl_urdf_path = bpy.props.StringProperty(
+        name="URDF Path",
+        description="Path to URDF file",
+        default="",
+        subtype='FILE_PATH',
     )
     bpy.types.Scene.stl_color_scheme = bpy.props.EnumProperty(
         name="Color",
@@ -367,8 +605,13 @@ def register():
         name="Overwrite",
         default=True,
     )
+    bpy.types.Scene.stl_join_meshes = bpy.props.BoolProperty(
+        name="Join Meshes",
+        description="Merge all parts into a single mesh object for OBJ export",
+        default=False,
+    )
 
-    print("[STL Transformer] Registered OK!")
+    print("[STL Transformer] v2.0 Registered OK!")
 
 
 def unregister():
@@ -380,7 +623,8 @@ def unregister():
 
     for prop_name in ["stl_input_dir", "stl_output_dir", "stl_color_scheme",
                        "stl_export_glb", "stl_export_obj", "stl_recursive",
-                       "stl_overwrite", "stl_converter_props"]:
+                       "stl_overwrite", "stl_mode", "stl_urdf_path",
+                       "stl_join_meshes", "stl_converter_props"]:
         if hasattr(bpy.types.Scene, prop_name):
             try:
                 delattr(bpy.types.Scene, prop_name)
